@@ -1,0 +1,59 @@
+.vc-typing-wpm-pill {
+    position: fixed;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    box-sizing: border-box;
+    padding: 0 10px;
+    color: var(--interactive-normal);
+    background: var(--background-floating);
+    border: 1px solid var(--border-subtle, var(--background-modifier-accent));
+    border-radius: 8px;
+    box-shadow: var(--elevation-low);
+    user-select: none;
+    pointer-events: auto;
+}
+
+.vc-typing-wpm-dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.vc-typing-wpm-value {
+    min-width: 2ch;
+    color: var(--white-500, #fff);
+    font-family: var(--font-code);
+    font-size: 16px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    text-align: right;
+}
+
+.vc-typing-wpm-label {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.vc-typing-wpm-pill.is-idle .vc-typing-wpm-dot {
+    background: var(--text-muted);
+}
+
+.vc-typing-wpm-pill.is-building .vc-typing-wpm-dot {
+    background: var(--status-warning);
+}
+
+.vc-typing-wpm-pill.is-steady .vc-typing-wpm-dot {
+    background: var(--brand-500);
+}
+
+.vc-typing-wpm-pill.is-fast .vc-typing-wpm-dot {
+    background: var(--status-positive);
+}
