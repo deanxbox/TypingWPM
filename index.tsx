@@ -7,9 +7,10 @@
 import "./styles.css";
 
 import { ChatBarButtonFactory } from "@api/ChatButtons";
+import * as DataStore from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { IconComponent, OptionType } from "@utils/types";
-import { React, ReactDOM, Tooltip } from "@webpack/common";
+import { Button, Forms, React, ReactDOM, Tooltip } from "@webpack/common";
 
 const settings = definePluginSettings({
     windowSeconds: {
@@ -42,17 +43,187 @@ const WPMEvents = (() => {
     };
 })();
 
+interface BadgePos {
+    top: number;
+    right: number;
+}
+
+interface DayStats {
+    date: string;
+    totalWpm: number;
+    samples: number;
+    bestWpm: number;
+}
+
+interface WPMStats {
+    days: Record<string, DayStats>;
+    totalWpm: number;
+    samples: number;
+    bestWpm: number;
+    updatedAt: number;
+}
+
+interface HeatmapDay {
+    date: string;
+    averageWpm: number;
+    bestWpm: number;
+    samples: number;
+}
+
 let charTimestamps: number[] = [];
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
 let portalRoot: HTMLDivElement | null = null;
+let statsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let lastSampleAt = 0;
+let statsCache = createEmptyStats();
 
 const BADGE_W = 120;
 const BADGE_H = 34;
 const BADGE_GAP = 8;
+const HEATMAP_DAYS = 35;
+const SAMPLE_INTERVAL_MS = 2000;
+const STATS_SAVE_DEBOUNCE_MS = 1000;
+const STATS_KEY = "TypingWPM_stats_v1";
 
-interface BadgePos {
-    top: number;
-    right: number;
+function createEmptyStats(): WPMStats {
+    return {
+        days: {},
+        totalWpm: 0,
+        samples: 0,
+        bestWpm: 0,
+        updatedAt: 0,
+    };
+}
+
+function getDateKey(timestamp = Date.now()): string {
+    const date = new Date(timestamp);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+
+    return `${year}-${month}-${day}`;
+}
+
+function getAverageWpm(totalWpm: number, samples: number): number {
+    if (samples === 0) return 0;
+    return Math.round(totalWpm / samples);
+}
+
+function cloneStats(stats: WPMStats): WPMStats {
+    return {
+        ...stats,
+        days: Object.fromEntries(
+            Object.entries(stats.days).map(([date, day]) => [date, { ...day }])
+        ),
+    };
+}
+
+function updateStatsSummary(stats: WPMStats): WPMStats {
+    const days = Object.values(stats.days);
+
+    stats.totalWpm = days.reduce((total, day) => total + day.totalWpm, 0);
+    stats.samples = days.reduce((total, day) => total + day.samples, 0);
+    stats.bestWpm = days.reduce((best, day) => Math.max(best, day.bestWpm), 0);
+
+    return stats;
+}
+
+function trimStats(stats: WPMStats): WPMStats {
+    const dates = Object.keys(stats.days).sort();
+    const staleDates = dates.slice(0, Math.max(0, dates.length - HEATMAP_DAYS));
+
+    for (const date of staleDates) {
+        delete stats.days[date];
+    }
+
+    return updateStatsSummary(stats);
+}
+
+function normaliseStats(rawStats: WPMStats | undefined): WPMStats {
+    if (!rawStats?.days) return createEmptyStats();
+
+    const stats = createEmptyStats();
+
+    for (const [date, rawDay] of Object.entries(rawStats.days)) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+
+        const samples = Number(rawDay.samples) || 0;
+        const totalWpm = Number(rawDay.totalWpm) || 0;
+        const bestWpm = Number(rawDay.bestWpm) || 0;
+        if (samples <= 0 || totalWpm <= 0) continue;
+
+        stats.days[date] = {
+            date,
+            totalWpm,
+            samples,
+            bestWpm,
+        };
+    }
+
+    stats.updatedAt = Number(rawStats.updatedAt) || 0;
+    return trimStats(stats);
+}
+
+async function loadStats() {
+    const savedStats = normaliseStats(await DataStore.get<WPMStats>(STATS_KEY));
+
+    if (savedStats.updatedAt >= statsCache.updatedAt) {
+        statsCache = savedStats;
+        WPMEvents.emit("statsUpdate");
+    }
+}
+
+function saveStatsNow() {
+    if (statsSaveTimer) {
+        clearTimeout(statsSaveTimer);
+        statsSaveTimer = null;
+    }
+
+    return DataStore.set(STATS_KEY, statsCache);
+}
+
+function scheduleStatsSave() {
+    if (statsSaveTimer) return;
+
+    statsSaveTimer = setTimeout(() => {
+        statsSaveTimer = null;
+        void DataStore.set(STATS_KEY, statsCache);
+    }, STATS_SAVE_DEBOUNCE_MS);
+}
+
+function recordWpmSample(wpm: number) {
+    const sample = Math.round(wpm);
+    const now = Date.now();
+
+    if (!Number.isFinite(sample) || sample <= 0) return;
+    if (now - lastSampleAt < SAMPLE_INTERVAL_MS) return;
+
+    lastSampleAt = now;
+
+    const date = getDateKey(now);
+    const day = statsCache.days[date] ??= {
+        date,
+        totalWpm: 0,
+        samples: 0,
+        bestWpm: 0,
+    };
+
+    day.totalWpm += sample;
+    day.samples++;
+    day.bestWpm = Math.max(day.bestWpm, sample);
+
+    statsCache.updatedAt = now;
+    statsCache = trimStats(statsCache);
+
+    WPMEvents.emit("statsUpdate");
+    scheduleStatsSave();
+}
+
+async function resetStats() {
+    statsCache = createEmptyStats();
+    lastSampleAt = 0;
+    await saveStatsNow();
+    WPMEvents.emit("statsUpdate");
 }
 
 function getWindowMs(): number {
@@ -164,15 +335,23 @@ function WPMWidget() {
     React.useEffect(() => {
         if (!visible && !showWhenIdle) return;
 
-        const interval = setInterval(() => setWpm(calcWPM()), 500);
+        const interval = setInterval(() => {
+            const currentWpm = calcWPM();
+            setWpm(currentWpm);
+            recordWpmSample(currentWpm);
+        }, 500);
+
         return () => clearInterval(interval);
     }, [showWhenIdle, visible]);
 
     React.useEffect(() => {
         function onKeystroke() {
+            const currentWpm = calcWPM();
+
             refresh();
-            setWpm(calcWPM());
+            setWpm(currentWpm);
             setVisible(true);
+            recordWpmSample(currentWpm);
 
             if (idleTimer) clearTimeout(idleTimer);
             idleTimer = setTimeout(() => {
@@ -212,6 +391,138 @@ function WPMWidget() {
                 getOrCreatePortalRoot()
             )}
         </Tooltip>
+    );
+}
+
+function getHeatmapDays(stats: WPMStats): HeatmapDay[] {
+    const today = new Date();
+    const days: HeatmapDay[] = [];
+
+    for (let i = HEATMAP_DAYS - 1; i >= 0; i--) {
+        const date = new Date(today);
+        date.setDate(today.getDate() - i);
+
+        const dateKey = getDateKey(date.getTime());
+        const day = stats.days[dateKey];
+
+        days.push({
+            date: dateKey,
+            averageWpm: day ? getAverageWpm(day.totalWpm, day.samples) : 0,
+            bestWpm: day?.bestWpm ?? 0,
+            samples: day?.samples ?? 0,
+        });
+    }
+
+    return days;
+}
+
+function getHeatLevel(averageWpm: number): number {
+    if (averageWpm === 0) return 0;
+    if (averageWpm < 35) return 1;
+    if (averageWpm < 60) return 2;
+    if (averageWpm < 85) return 3;
+    return 4;
+}
+
+function formatDate(dateKey: string): string {
+    return new Date(`${dateKey}T00:00:00`).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+    });
+}
+
+function useWPMStats(): WPMStats {
+    const [stats, setStats] = React.useState(() => cloneStats(statsCache));
+
+    React.useEffect(() => {
+        let mounted = true;
+
+        DataStore.get<WPMStats>(STATS_KEY).then(rawStats => {
+            if (!mounted) return;
+
+            const savedStats = normaliseStats(rawStats);
+            if (savedStats.updatedAt > statsCache.updatedAt) {
+                statsCache = savedStats;
+            }
+
+            setStats(cloneStats(statsCache));
+        });
+
+        const onStatsUpdate = () => setStats(cloneStats(statsCache));
+
+        WPMEvents.on("statsUpdate", onStatsUpdate);
+        return () => {
+            mounted = false;
+            WPMEvents.off("statsUpdate", onStatsUpdate);
+        };
+    }, []);
+
+    return stats;
+}
+
+function StatBlock({ label, value, suffix }: { label: string; value: number; suffix?: string; }) {
+    return (
+        <div className="vc-typing-wpm-stat">
+            <span className="vc-typing-wpm-stat-label">{label}</span>
+            <span className="vc-typing-wpm-stat-value">
+                {value}
+                {suffix && <span>{suffix}</span>}
+            </span>
+        </div>
+    );
+}
+
+function WPMStatsSettings() {
+    const stats = useWPMStats();
+    const heatmapDays = getHeatmapDays(stats);
+    const today = stats.days[getDateKey()];
+    const averageWpm = getAverageWpm(stats.totalWpm, stats.samples);
+    const todayAverageWpm = today ? getAverageWpm(today.totalWpm, today.samples) : 0;
+
+    return (
+        <div className="vc-typing-wpm-settings">
+            <Forms.FormTitle tag="h3">Typing Stats</Forms.FormTitle>
+
+            <div className="vc-typing-wpm-stat-grid">
+                <StatBlock label="Average" value={averageWpm} suffix=" WPM" />
+                <StatBlock label="Today" value={todayAverageWpm} suffix=" WPM" />
+                <StatBlock label="Best" value={stats.bestWpm} suffix=" WPM" />
+                <StatBlock label="Samples" value={stats.samples} />
+            </div>
+
+            <div className="vc-typing-wpm-heatmap-header">
+                <Forms.FormTitle tag="h4">Last 35 Days</Forms.FormTitle>
+                <Forms.FormText>{stats.samples === 0 ? "No typing samples yet" : `${stats.samples} tracked samples`}</Forms.FormText>
+            </div>
+
+            <div className="vc-typing-wpm-heatmap" role="img" aria-label="Typing WPM heatmap for the last 35 days">
+                {heatmapDays.map(day => {
+                    const averageText = day.samples === 0 ? "No samples" : `${day.averageWpm} average WPM, ${day.bestWpm} best WPM`;
+
+                    return (
+                        <Tooltip key={day.date} text={`${formatDate(day.date)} - ${averageText}`}>
+                            {({ onMouseEnter, onMouseLeave }) => (
+                                <div
+                                    className={`vc-typing-wpm-heatmap-cell level-${getHeatLevel(day.averageWpm)}`}
+                                    onMouseEnter={onMouseEnter}
+                                    onMouseLeave={onMouseLeave}
+                                    aria-label={`${formatDate(day.date)}: ${averageText}`}
+                                />
+                            )}
+                        </Tooltip>
+                    );
+                })}
+            </div>
+
+            <Button
+                className="vc-typing-wpm-reset"
+                color={Button.Colors.RED}
+                size={Button.Sizes.SMALL}
+                onClick={() => void resetStats()}
+            >
+                Reset Stats
+            </Button>
+        </div>
     );
 }
 
@@ -261,12 +572,14 @@ export default definePlugin({
     description: "Shows a compact typing speed badge above the message box.",
     authors: [{ name: ".dean.", id: 285021062578700289n }],
     settings,
+    settingsAboutComponent: WPMStatsSettings,
     chatBarButton: {
         icon: TypingWPMIcon,
         render: WPMChatBarButton,
     },
 
     start() {
+        void loadStats();
         document.addEventListener("keydown", handleKeyDown, true);
     },
 
@@ -279,5 +592,7 @@ export default definePlugin({
             clearTimeout(idleTimer);
             idleTimer = null;
         }
+
+        void saveStatsNow();
     },
 });

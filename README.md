@@ -10,6 +10,8 @@ It displays a compact WPM badge while you type, using Discord/Vencord theme toke
 - Compact badge positioned above the message box
 - Pace indicator dot for idle, warming up, steady, and fast typing states
 - Tooltip with the current typing pace and exact WPM
+- Persistent average WPM tracker in plugin settings
+- 35-day typing heatmap with daily average and best WPM tooltips
 - Optional idle visibility mode that keeps the badge visible at `0 WPM`
 - Theme-aware styling with a high-contrast WPM value
 
@@ -25,6 +27,8 @@ It displays a compact WPM badge while you type, using Discord/Vencord theme toke
 TypingWPM listens for printable key presses inside the Discord message composer, stores recent keystroke timestamps, and estimates WPM using the common `5 characters = 1 word` convention.
 
 The badge automatically repositions when the window, scroll position, or chat layout changes.
+
+Typing stats are stored locally through Vencord's DataStore. The plugin records non-zero WPM samples while you type, then aggregates them by day for the settings heatmap.
 
 ## Installation
 
