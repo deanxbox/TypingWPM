@@ -85,7 +85,7 @@ const PAUSE_MS = 2000; // gaps longer than this are thinking time, not typing ti
 const MIN_KEYS = 5;
 const MIN_ACTIVE_MS = 1500;
 const ACTIVE_SAMPLE_MS = 1200; // only sample while the last key was this recent
-const GAUGE_MAX_WPM = 120;
+const GAUGE_MAX_WPM = 160;
 const SAMPLE_INTERVAL_MS = 2000;
 const STATS_SAVE_DEBOUNCE_MS = 1000;
 const STATS_KEY = "TypingWPM_stats_v1";
@@ -298,17 +298,17 @@ function getPace(wpm: number) {
         label: "Idle",
     };
 
-    if (wpm < 30) return {
+    if (wpm < 50) return {
         className: "is-building",
         label: "Warming up",
     };
 
-    if (wpm < 60) return {
+    if (wpm < 90) return {
         className: "is-steady",
         label: "Steady pace",
     };
 
-    if (wpm < 90) return {
+    if (wpm < 130) return {
         className: "is-fast",
         label: "Fast pace",
     };
@@ -445,9 +445,9 @@ function getHeatmapDays(stats: WPMStats): HeatmapDay[] {
 
 function getHeatLevel(averageWpm: number): number {
     if (averageWpm === 0) return 0;
-    if (averageWpm < 35) return 1;
-    if (averageWpm < 60) return 2;
-    if (averageWpm < 85) return 3;
+    if (averageWpm < 50) return 1;
+    if (averageWpm < 90) return 2;
+    if (averageWpm < 130) return 3;
     return 4;
 }
 

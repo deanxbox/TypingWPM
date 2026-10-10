@@ -7,8 +7,8 @@ It displays a compact WPM badge while you type, using Discord/Vencord theme toke
 ## Features
 
 - Live words-per-minute calculation while typing in the main chat input
-- Compact pill positioned above the message box, coloured by pace, with a gauge bar that fills toward 120 WPM
-- Pace states: idle, warming up (<30), steady (30-60), fast (60-90), and blazing (90+)
+- Compact pill positioned above the message box, coloured by pace, with a gauge bar that fills toward 160 WPM
+- Pace states: idle, warming up (<50), steady (50-90), fast (90-130), and blazing (130+)
 - Tooltip with the current typing pace and exact WPM
 - Persistent average WPM tracker in plugin settings
 - 35-day typing heatmap with daily average and best WPM tooltips, plus a slower-to-faster legend
