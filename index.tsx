@@ -15,8 +15,8 @@ import { Button, Forms, React, ReactDOM, Tooltip } from "@webpack/common";
 const settings = definePluginSettings({
     windowSeconds: {
         type: OptionType.NUMBER,
-        description: "Rolling window in seconds for WPM calculation",
-        default: 5,
+        description: "Rolling window in seconds for WPM calculation (longer = smoother)",
+        default: 8,
         restartNeeded: false,
     },
     showWhenIdle: {
@@ -77,10 +77,15 @@ let statsSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let lastSampleAt = 0;
 let statsCache = createEmptyStats();
 
-const BADGE_W = 120;
-const BADGE_H = 34;
+const BADGE_W = 136;
+const BADGE_H = 36;
 const BADGE_GAP = 8;
 const HEATMAP_DAYS = 35;
+const PAUSE_MS = 2000; // gaps longer than this are thinking time, not typing time
+const MIN_KEYS = 5;
+const MIN_ACTIVE_MS = 1500;
+const ACTIVE_SAMPLE_MS = 1200; // only sample while the last key was this recent
+const GAUGE_MAX_WPM = 120;
 const SAMPLE_INTERVAL_MS = 2000;
 const STATS_SAVE_DEBOUNCE_MS = 1000;
 const STATS_KEY = "TypingWPM_stats_v1";
@@ -195,7 +200,7 @@ function recordWpmSample(wpm: number) {
     const sample = Math.round(wpm);
     const now = Date.now();
 
-    if (!Number.isFinite(sample) || sample <= 0) return;
+    if (!Number.isFinite(sample) || sample <= 0 || !isActivelyTyping()) return;
     if (now - lastSampleAt < SAMPLE_INTERVAL_MS) return;
 
     lastSampleAt = now;
@@ -230,15 +235,28 @@ function getWindowMs(): number {
     return ((settings.store.windowSeconds as number | undefined) ?? 5) * 1000;
 }
 
+// Speed over time actually spent typing: pauses and trailing idle time don't drag the score down.
 function calcWPM(): number {
     const now = Date.now();
     const windowMs = getWindowMs();
 
     charTimestamps = charTimestamps.filter(t => now - t <= windowMs);
-    if (charTimestamps.length < 2) return 0;
+    if (charTimestamps.length < MIN_KEYS) return 0;
 
-    const elapsedMs = Math.max(now - charTimestamps[0], 1000);
-    return Math.round((charTimestamps.length / 5) / (elapsedMs / 60_000));
+    let activeMs = 0;
+    for (let i = 1; i < charTimestamps.length; i++) {
+        const gap = charTimestamps[i] - charTimestamps[i - 1];
+        if (gap <= PAUSE_MS) activeMs += gap;
+    }
+    if (activeMs < MIN_ACTIVE_MS) return 0;
+
+    // n keystrokes span n-1 intervals
+    return Math.round(((charTimestamps.length - 1) / 5) / (activeMs / 60_000));
+}
+
+function isActivelyTyping(): boolean {
+    const last = charTimestamps[charTimestamps.length - 1];
+    return last !== undefined && Date.now() - last <= ACTIVE_SAMPLE_MS;
 }
 
 function getOrCreatePortalRoot(): HTMLDivElement {
@@ -280,19 +298,24 @@ function getPace(wpm: number) {
         label: "Idle",
     };
 
-    if (wpm < 40) return {
+    if (wpm < 30) return {
         className: "is-building",
         label: "Warming up",
     };
 
-    if (wpm < 80) return {
+    if (wpm < 60) return {
         className: "is-steady",
         label: "Steady pace",
     };
 
-    return {
+    if (wpm < 90) return {
         className: "is-fast",
         label: "Fast pace",
+    };
+
+    return {
+        className: "is-blazing",
+        label: "Blazing",
     };
 }
 
@@ -387,6 +410,10 @@ function WPMWidget() {
                     <span className="vc-typing-wpm-dot" />
                     <span className="vc-typing-wpm-value">{wpm}</span>
                     <span className="vc-typing-wpm-label">WPM</span>
+                    <span
+                        className="vc-typing-wpm-gauge"
+                        style={{ width: `${Math.min(100, (wpm / GAUGE_MAX_WPM) * 100)}%` }}
+                    />
                 </div>,
                 getOrCreatePortalRoot()
             )}
@@ -460,9 +487,9 @@ function useWPMStats(): WPMStats {
     return stats;
 }
 
-function StatBlock({ label, value, suffix }: { label: string; value: number; suffix?: string; }) {
+function StatBlock({ label, value, suffix, accent }: { label: string; value: number; suffix?: string; accent?: string; }) {
     return (
-        <div className="vc-typing-wpm-stat">
+        <div className={`vc-typing-wpm-stat ${accent ? "accent-" + accent : ""}`}>
             <span className="vc-typing-wpm-stat-label">{label}</span>
             <span className="vc-typing-wpm-stat-value">
                 {value}
@@ -484,9 +511,9 @@ function WPMStatsSettings() {
             <Forms.FormTitle tag="h3">Typing Stats</Forms.FormTitle>
 
             <div className="vc-typing-wpm-stat-grid">
-                <StatBlock label="Average" value={averageWpm} suffix=" WPM" />
-                <StatBlock label="Today" value={todayAverageWpm} suffix=" WPM" />
-                <StatBlock label="Best" value={stats.bestWpm} suffix=" WPM" />
+                <StatBlock label="Average" value={averageWpm} suffix=" WPM" accent="steady" />
+                <StatBlock label="Today" value={todayAverageWpm} suffix=" WPM" accent="building" />
+                <StatBlock label="Best" value={stats.bestWpm} suffix=" WPM" accent="fast" />
                 <StatBlock label="Samples" value={stats.samples} />
             </div>
 
@@ -512,6 +539,12 @@ function WPMStatsSettings() {
                         </Tooltip>
                     );
                 })}
+            </div>
+
+            <div className="vc-typing-wpm-legend" aria-hidden="true">
+                <span>Slower</span>
+                {[0, 1, 2, 3, 4].map(l => <i key={l} className={`vc-typing-wpm-heatmap-cell level-${l}`} />)}
+                <span>Faster</span>
             </div>
 
             <Button
@@ -560,7 +593,7 @@ function handleKeyDown(e: KeyboardEvent) {
 
     if (!inMessageBox) return;
     if (!target.closest("form")) return;
-    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.ctrlKey || e.altKey || e.metaKey || e.repeat) return;
     if (!PRINTABLE_RE.test(e.key)) return;
 
     charTimestamps.push(Date.now());

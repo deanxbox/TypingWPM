@@ -8,7 +8,7 @@
     box-sizing: border-box;
     padding: 0 10px;
     color: var(--interactive-normal);
-    background: var(--background-floating);
+    background: var(--background-floating, #111214);
     border: 1px solid var(--border-subtle, var(--background-modifier-accent));
     border-radius: 8px;
     box-shadow: var(--elevation-low);
@@ -158,3 +158,62 @@
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 }
+
+/* --- revamp overrides --- */
+.vc-typing-wpm-pill {
+    overflow: hidden;
+    border-radius: 18px;
+    padding: 0 14px;
+    backdrop-filter: blur(8px);
+    transition: border-color 0.25s, box-shadow 0.25s;
+}
+
+.vc-typing-wpm-pill.is-idle { color: var(--text-muted, #949ba4); }
+
+.vc-typing-wpm-dot { transition: background 0.25s, box-shadow 0.25s; }
+
+.vc-typing-wpm-pill:not(.is-idle) .vc-typing-wpm-dot {
+    box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 0%, transparent), 0 0 8px currentColor;
+}
+
+.vc-typing-wpm-pill.is-building { color: var(--status-warning, #f0b232); }
+.vc-typing-wpm-pill.is-steady { color: var(--brand-500, #5865f2); }
+.vc-typing-wpm-pill.is-fast { color: var(--status-positive, #23a55a); }
+.vc-typing-wpm-pill.is-blazing { color: var(--status-danger, #f23f43); }
+
+.vc-typing-wpm-pill .vc-typing-wpm-dot { background: currentColor !important; }
+.vc-typing-wpm-pill .vc-typing-wpm-value { color: var(--text-default, var(--white-500, #fff)); }
+.vc-typing-wpm-pill:not(.is-idle) { border-color: color-mix(in srgb, currentColor 45%, transparent); }
+
+.vc-typing-wpm-gauge {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 3px;
+    background: currentColor;
+    border-radius: 0 3px 3px 0;
+    transition: width 0.4s ease;
+}
+
+.vc-typing-wpm-stat {
+    border-top: 3px solid var(--background-modifier-accent);
+    border-radius: 10px;
+}
+.vc-typing-wpm-stat.accent-steady { border-top-color: var(--brand-500); }
+.vc-typing-wpm-stat.accent-building { border-top-color: var(--status-warning); }
+.vc-typing-wpm-stat.accent-fast { border-top-color: var(--status-positive); }
+.vc-typing-wpm-stat-value { font-size: 24px; }
+
+.vc-typing-wpm-heatmap { grid-template-columns: repeat(7, 22px); gap: 6px; }
+.vc-typing-wpm-heatmap-cell { width: 22px; height: 22px; border-radius: 6px; transition: transform 0.15s; }
+.vc-typing-wpm-heatmap-cell:hover { transform: scale(1.15); }
+
+.vc-typing-wpm-legend {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-muted);
+    font-size: 11px;
+}
+.vc-typing-wpm-legend .vc-typing-wpm-heatmap-cell { width: 12px; height: 12px; border-radius: 3px; }
+
