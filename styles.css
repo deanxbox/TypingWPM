@@ -217,3 +217,35 @@
 }
 .vc-typing-wpm-legend .vc-typing-wpm-heatmap-cell { width: 12px; height: 12px; border-radius: 3px; }
 
+
+.vc-typing-wpm-stat.accent-accuracy { border-top-color: var(--status-danger, #f23f43); }
+.vc-typing-wpm-stat-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+@media (max-width: 720px) { .vc-typing-wpm-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.vc-typing-wpm-keyboard-wrap { display: flex; flex-direction: column; gap: 8px; }
+.vc-typing-wpm-keyboard { --wpm-key: 34px; display: flex; flex-direction: column; gap: 4px; width: max-content; max-width: 100%; overflow-x: auto; padding-bottom: 4px; }
+.vc-typing-wpm-key-row { display: flex; gap: 4px; }
+.vc-typing-wpm-key {
+    width: var(--wpm-key);
+    height: var(--wpm-key);
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    color: #fff;
+    font-family: var(--font-code);
+    font-size: 12px;
+    font-weight: 700;
+    background: hsl(var(--wpm-hue, 0) 60% 30%);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+    transition: transform 0.15s;
+}
+.vc-typing-wpm-key:hover { transform: scale(1.1); }
+.vc-typing-wpm-key.is-unknown { background: var(--background-modifier-accent); color: var(--text-muted); text-shadow: none; }
+.vc-typing-wpm-key.is-space { width: calc(var(--wpm-key) * 6 + 20px); }
+.vc-typing-wpm-key.is-best { border-color: #fff; box-shadow: 0 0 0 2px var(--status-positive, #23a55a); }
+.vc-typing-wpm-key.is-worst { border-color: #fff; box-shadow: 0 0 0 2px var(--status-danger, #f23f43); }
+

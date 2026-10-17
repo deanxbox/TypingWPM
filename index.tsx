@@ -48,11 +48,14 @@ interface BadgePos {
     right: number;
 }
 
+type KeyTally = [total: number, errors: number];
+
 interface DayStats {
     date: string;
     totalWpm: number;
     samples: number;
     bestWpm: number;
+    keys?: Record<string, KeyTally>;
 }
 
 interface WPMStats {
@@ -60,6 +63,8 @@ interface WPMStats {
     totalWpm: number;
     samples: number;
     bestWpm: number;
+    keyTotal: number;
+    keyErrors: number;
     updatedAt: number;
 }
 
@@ -76,6 +81,17 @@ let portalRoot: HTMLDivElement | null = null;
 let statsSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let lastSampleAt = 0;
 let statsCache = createEmptyStats();
+// Accuracy is tallied after the fact: keydown only appends to these arrays, flushPending() does the maths.
+let pendingKeys: string[] = [];
+let pendingErrors: string[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let counted: Array<[key: string, date: string]> = []; // tail of already-tallied keys of the current draft, so later corrections still blame the right key
+let lateErrors: Array<[key: string, date: string]> = [];
+let lastTarget: EventTarget | null = null;
+let loaded = false; // nothing is recorded or saved until saved history has been read
+let loadGen = 0;
+let loading: Promise<void> | null = null;
+let loadingGen = -1;
 
 const BADGE_W = 136;
 const BADGE_H = 36;
@@ -89,6 +105,10 @@ const GAUGE_MAX_WPM = 160;
 const SAMPLE_INTERVAL_MS = 2000;
 const STATS_SAVE_DEBOUNCE_MS = 1000;
 const STATS_KEY = "TypingWPM_stats_v1";
+const FLUSH_IDLE_MS = 15_000;
+const MAX_PENDING = 500;
+const COUNTED_TAIL = 50;
+const MIN_KEY_SAMPLES = 20; // keys with fewer presses are shown grey and never ranked
 
 function createEmptyStats(): WPMStats {
     return {
@@ -96,8 +116,14 @@ function createEmptyStats(): WPMStats {
         totalWpm: 0,
         samples: 0,
         bestWpm: 0,
+        keyTotal: 0,
+        keyErrors: 0,
         updatedAt: 0,
     };
+}
+
+function getDay(date: string): DayStats {
+    return statsCache.days[date] ??= { date, totalWpm: 0, samples: 0, bestWpm: 0 };
 }
 
 function getDateKey(timestamp = Date.now()): string {
@@ -118,7 +144,7 @@ function cloneStats(stats: WPMStats): WPMStats {
     return {
         ...stats,
         days: Object.fromEntries(
-            Object.entries(stats.days).map(([date, day]) => [date, { ...day }])
+            Object.entries(stats.days).map(([date, day]) => [date, { ...day, keys: day.keys && { ...day.keys } }])
         ),
     };
 }
@@ -129,16 +155,25 @@ function updateStatsSummary(stats: WPMStats): WPMStats {
     stats.totalWpm = days.reduce((total, day) => total + day.totalWpm, 0);
     stats.samples = days.reduce((total, day) => total + day.samples, 0);
     stats.bestWpm = days.reduce((best, day) => Math.max(best, day.bestWpm), 0);
+    stats.keyTotal = 0;
+    stats.keyErrors = 0;
+    for (const day of days) {
+        for (const [total, errors] of Object.values(day.keys ?? {})) {
+            stats.keyTotal += total;
+            stats.keyErrors += errors;
+        }
+    }
 
     return stats;
 }
 
 function trimStats(stats: WPMStats): WPMStats {
-    const dates = Object.keys(stats.days).sort();
-    const staleDates = dates.slice(0, Math.max(0, dates.length - HEATMAP_DAYS));
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - (HEATMAP_DAYS - 1));
+    const cutoff = getDateKey(cutoffDate.getTime());
 
-    for (const date of staleDates) {
-        delete stats.days[date];
+    for (const date of Object.keys(stats.days)) {
+        if (date < cutoff) delete stats.days[date];
     }
 
     return updateStatsSummary(stats);
@@ -150,18 +185,28 @@ function normaliseStats(rawStats: WPMStats | undefined): WPMStats {
     const stats = createEmptyStats();
 
     for (const [date, rawDay] of Object.entries(rawStats.days)) {
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+        if (!rawDay || !/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
 
         const samples = Number(rawDay.samples) || 0;
         const totalWpm = Number(rawDay.totalWpm) || 0;
         const bestWpm = Number(rawDay.bestWpm) || 0;
-        if (samples <= 0 || totalWpm <= 0) continue;
+
+        const keys: Record<string, KeyTally> = {};
+        for (const [key, tally] of Object.entries(rawDay.keys ?? {})) {
+            const total = Number(tally?.[0]);
+            const errors = Number(tally?.[1]);
+            if (key && total > 0 && errors >= 0 && errors <= total) keys[key] = [total, errors];
+        }
+
+        const hasKeys = Object.keys(keys).length > 0;
+        if ((samples <= 0 || totalWpm <= 0) && !hasKeys) continue;
 
         stats.days[date] = {
             date,
             totalWpm,
             samples,
             bestWpm,
+            ...(hasKeys && { keys }),
         };
     }
 
@@ -169,13 +214,30 @@ function normaliseStats(rawStats: WPMStats | undefined): WPMStats {
     return trimStats(stats);
 }
 
-async function loadStats() {
-    const savedStats = normaliseStats(await DataStore.get<WPMStats>(STATS_KEY));
+function loadStats(): Promise<void> {
+    if (loaded) return Promise.resolve();
+    if (loading && loadingGen === loadGen) return loading;
 
-    if (savedStats.updatedAt >= statsCache.updatedAt) {
-        statsCache = savedStats;
-        WPMEvents.emit("statsUpdate");
-    }
+    const gen = loadGen;
+    loadingGen = gen;
+    let mine!: Promise<void>; // assigned below; the async body only reads it after its first await
+    mine = loading = (async () => {
+        try {
+            const saved = normaliseStats(await DataStore.get<WPMStats>(STATS_KEY));
+            if (gen !== loadGen) return; // reset/stop happened mid-read; don't resurrect old data
+
+            statsCache = saved;
+            loaded = true;
+            WPMEvents.emit("statsUpdate");
+            flushPending();
+        } catch (err) {
+            // stay unloaded so a failed read can never be followed by a save that wipes history
+            console.error("[TypingWPM] failed to load stats", err);
+        } finally {
+            if (loading === mine) loading = null;
+        }
+    })();
+    return mine;
 }
 
 function saveStatsNow() {
@@ -184,7 +246,8 @@ function saveStatsNow() {
         statsSaveTimer = null;
     }
 
-    return DataStore.set(STATS_KEY, statsCache);
+    if (!loaded) return Promise.resolve();
+    return DataStore.set(STATS_KEY, statsCache).catch(err => console.error("[TypingWPM] failed to save stats", err));
 }
 
 function scheduleStatsSave() {
@@ -192,7 +255,7 @@ function scheduleStatsSave() {
 
     statsSaveTimer = setTimeout(() => {
         statsSaveTimer = null;
-        void DataStore.set(STATS_KEY, statsCache);
+        void saveStatsNow();
     }, STATS_SAVE_DEBOUNCE_MS);
 }
 
@@ -200,18 +263,13 @@ function recordWpmSample(wpm: number) {
     const sample = Math.round(wpm);
     const now = Date.now();
 
-    if (!Number.isFinite(sample) || sample <= 0 || !isActivelyTyping()) return;
+    if (!loaded || !Number.isFinite(sample) || sample <= 0 || !isActivelyTyping()) return;
     if (now - lastSampleAt < SAMPLE_INTERVAL_MS) return;
 
     lastSampleAt = now;
 
     const date = getDateKey(now);
-    const day = statsCache.days[date] ??= {
-        date,
-        totalWpm: 0,
-        samples: 0,
-        bestWpm: 0,
-    };
+    const day = getDay(date);
 
     day.totalWpm += sample;
     day.samples++;
@@ -224,7 +282,76 @@ function recordWpmSample(wpm: number) {
     scheduleStatsSave();
 }
 
+// Folds the buffered keystrokes into today's per-key tallies. A key later removed with Backspace counts as an error.
+function flushPending() {
+    if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+    }
+    if (!loaded) return; // buffers are kept and flushed once history has loaded
+    if (!pendingKeys.length && !pendingErrors.length && !lateErrors.length) return;
+
+    const now = Date.now();
+    const keys = (getDay(getDateKey(now)).keys ??= {});
+    const add = (key: string, errors: number) => {
+        if (key === "\n") return;
+        const [total, wrong] = keys[key] ?? [0, 0];
+        keys[key] = [total + 1, wrong + errors];
+    };
+
+    pendingKeys.forEach(key => add(key, 0));
+    pendingErrors.forEach(key => add(key, 1));
+    for (const [key, date] of lateErrors) {
+        const tally = statsCache.days[date]?.keys?.[key]; // day may have been trimmed away
+        if (tally) tally[1] = Math.min(tally[0], tally[1] + 1);
+    }
+
+    const today = getDateKey(now);
+    counted = [...counted, ...pendingKeys.map((k): [string, string] => [k, today])].slice(-COUNTED_TAIL);
+    pendingKeys = [];
+    pendingErrors = [];
+    lateErrors = [];
+
+    statsCache.updatedAt = now;
+    statsCache = trimStats(statsCache);
+    WPMEvents.emit("statsUpdate");
+    scheduleStatsSave();
+}
+
+function scheduleFlush() {
+    if (flushTimer) clearTimeout(flushTimer);
+    flushTimer = setTimeout(flushPending, FLUSH_IDLE_MS);
+}
+
+// Draft ended or became untrackable (sent, caret moved, other editor): bank what we have and forget the tail.
+function resetDraft() {
+    flushPending();
+    counted = [];
+}
+
+// shortcut: assumes the caret is at the end of the draft, so mid-text edits and pastes are not tracked; upgrade by diffing the composer text.
+function recordBackspace(wholeWord: boolean) {
+    const last = () => pendingKeys.length ? pendingKeys[pendingKeys.length - 1] : counted[counted.length - 1]?.[0];
+    const eraseOne = () => {
+        const key = pendingKeys.pop();
+        if (key !== undefined) return void pendingErrors.push(key);
+        const old = counted.pop();
+        if (old !== undefined) lateErrors.push(old);
+    };
+
+    if (!wholeWord) return eraseOne();
+
+    while (last() === " ") eraseOne();
+    while (last() !== undefined && last() !== " ") eraseOne();
+}
+
 async function resetStats() {
+    pendingKeys = [];
+    pendingErrors = [];
+    lateErrors = [];
+    counted = [];
+    loadGen++;
+    loaded = true;
     statsCache = createEmptyStats();
     lastSampleAt = 0;
     await saveStatsNow();
@@ -232,7 +359,8 @@ async function resetStats() {
 }
 
 function getWindowMs(): number {
-    return ((settings.store.windowSeconds as number | undefined) ?? 5) * 1000;
+    const seconds = Number(settings.store.windowSeconds);
+    return (Number.isFinite(seconds) && seconds >= 3 ? seconds : 8) * 1000;
 }
 
 // Speed over time actually spent typing: pauses and trailing idle time don't drag the score down.
@@ -244,14 +372,17 @@ function calcWPM(): number {
     if (charTimestamps.length < MIN_KEYS) return 0;
 
     let activeMs = 0;
+    let activeIntervals = 0;
     for (let i = 1; i < charTimestamps.length; i++) {
         const gap = charTimestamps[i] - charTimestamps[i - 1];
-        if (gap <= PAUSE_MS) activeMs += gap;
+        if (gap <= PAUSE_MS) {
+            activeMs += gap;
+            activeIntervals++; // keys after a pause count only for the time they actually took
+        }
     }
     if (activeMs < MIN_ACTIVE_MS) return 0;
 
-    // n keystrokes span n-1 intervals
-    return Math.round(((charTimestamps.length - 1) / 5) / (activeMs / 60_000));
+    return Math.round((activeIntervals / 5) / (activeMs / 60_000));
 }
 
 function isActivelyTyping(): boolean {
@@ -462,24 +593,12 @@ function useWPMStats(): WPMStats {
     const [stats, setStats] = React.useState(() => cloneStats(statsCache));
 
     React.useEffect(() => {
-        let mounted = true;
-
-        DataStore.get<WPMStats>(STATS_KEY).then(rawStats => {
-            if (!mounted) return;
-
-            const savedStats = normaliseStats(rawStats);
-            if (savedStats.updatedAt > statsCache.updatedAt) {
-                statsCache = savedStats;
-            }
-
-            setStats(cloneStats(statsCache));
-        });
+        void loadStats();
 
         const onStatsUpdate = () => setStats(cloneStats(statsCache));
 
         WPMEvents.on("statsUpdate", onStatsUpdate);
         return () => {
-            mounted = false;
             WPMEvents.off("statsUpdate", onStatsUpdate);
         };
     }, []);
@@ -487,7 +606,94 @@ function useWPMStats(): WPMStats {
     return stats;
 }
 
-function StatBlock({ label, value, suffix, accent }: { label: string; value: number; suffix?: string; accent?: string; }) {
+function getAccuracy(total: number, errors: number): number | null {
+    if (total === 0) return null;
+    return Math.round((1 - errors / total) * 1000) / 10;
+}
+
+const KEY_ROWS = [
+    { keys: "1234567890-=", offset: 0 },
+    { keys: "qwertyuiop[]", offset: 0.5 },
+    { keys: "asdfghjkl;'", offset: 0.75 },
+    { keys: "zxcvbnm,./", offset: 1.25 },
+];
+
+function AccuracyKeyboard({ stats }: { stats: WPMStats; }) {
+    const tallies: Record<string, KeyTally> = {};
+    for (const day of Object.values(stats.days)) {
+        for (const [key, [total, errors]] of Object.entries(day.keys ?? {})) {
+            const t = tallies[key] ??= [0, 0];
+            t[0] += total;
+            t[1] += errors;
+        }
+    }
+
+    const shown = ["space", ...KEY_ROWS.flatMap(row => [...row.keys])];
+    const accuracyOf = (key: string) => {
+        const [total, errors] = tallies[key === "space" ? " " : key] ?? [0, 0];
+        return { total, accuracy: total >= MIN_KEY_SAMPLES ? 1 - errors / total : null };
+    };
+
+    const ranked = shown
+        .map(key => ({ key, ...accuracyOf(key) }))
+        .filter((k): k is { key: string; total: number; accuracy: number; } => k.accuracy !== null)
+        .sort((a, b) => b.accuracy - a.accuracy);
+    const best = ranked[0];
+    const worst = ranked.length > 1 && ranked[0].accuracy !== ranked[ranked.length - 1].accuracy ? ranked[ranked.length - 1] : undefined;
+    const spread = best && worst ? Math.max(best.accuracy - worst.accuracy, 0.02) : 1;
+
+    const renderKey = (id: string) => {
+        const { total, accuracy } = accuracyOf(id);
+        const label = id === "space" ? "Space" : id.toUpperCase();
+        const tip = accuracy === null
+            ? `${label} - ${total}/${MIN_KEY_SAMPLES} presses needed`
+            : `${label} - ${(accuracy * 100).toFixed(1)}% accurate over ${total} presses`;
+        const hue = accuracy === null ? 0 : !worst ? 120 : Math.round(((accuracy - worst.accuracy) / spread) * 120);
+        const mark = accuracy === null || !worst ? "" : id === best?.key ? " is-best" : id === worst.key ? " is-worst" : "";
+
+        return (
+            <Tooltip key={id} text={tip}>
+                {({ onMouseEnter, onMouseLeave }) => (
+                    <div
+                        role="img"
+                        className={`vc-typing-wpm-key${accuracy === null ? " is-unknown" : ""}${mark}${id === "space" ? " is-space" : ""}`}
+                        style={{ "--wpm-hue": hue } as React.CSSProperties}
+                        onMouseEnter={onMouseEnter}
+                        onMouseLeave={onMouseLeave}
+                        aria-label={tip}
+                    >
+                        {id === "space" ? "" : label}
+                    </div>
+                )}
+            </Tooltip>
+        );
+    };
+
+    return (
+        <div className="vc-typing-wpm-keyboard-wrap">
+            <div className="vc-typing-wpm-heatmap-header">
+                <Forms.FormTitle tag="h4">Key Accuracy</Forms.FormTitle>
+                <Forms.FormText>
+                    {best && worst
+                        ? `Best ${best.key === "space" ? "Space" : best.key.toUpperCase()} ${(best.accuracy * 100).toFixed(1)}% · Worst ${worst.key === "space" ? "Space" : worst.key.toUpperCase()} ${(worst.accuracy * 100).toFixed(1)}%`
+                        : ranked.length > 1 ? "All ranked keys are tied so far" : `Type ${MIN_KEY_SAMPLES}+ presses on a few keys to rank them`}
+                </Forms.FormText>
+            </div>
+            <div className="vc-typing-wpm-keyboard">
+                {KEY_ROWS.map(row => (
+                    <div key={row.keys} className="vc-typing-wpm-key-row" style={{ marginLeft: `calc(${row.offset} * (var(--wpm-key) + 4px))` }}>
+                        {[...row.keys].map(renderKey)}
+                    </div>
+                ))}
+                <div className="vc-typing-wpm-key-row" style={{ marginLeft: `calc(3.5 * (var(--wpm-key) + 4px))` }}>
+                    {renderKey("space")}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function StatBlock({ label, value, suffix, accent }: { label: string; value: number | string; suffix?: string; accent?: string; }) {
     return (
         <div className={`vc-typing-wpm-stat ${accent ? "accent-" + accent : ""}`}>
             <span className="vc-typing-wpm-stat-label">{label}</span>
@@ -504,6 +710,7 @@ function WPMStatsSettings() {
     const heatmapDays = getHeatmapDays(stats);
     const today = stats.days[getDateKey()];
     const averageWpm = getAverageWpm(stats.totalWpm, stats.samples);
+    const accuracy = getAccuracy(stats.keyTotal, stats.keyErrors);
     const todayAverageWpm = today ? getAverageWpm(today.totalWpm, today.samples) : 0;
 
     return (
@@ -514,6 +721,7 @@ function WPMStatsSettings() {
                 <StatBlock label="Average" value={averageWpm} suffix=" WPM" accent="steady" />
                 <StatBlock label="Today" value={todayAverageWpm} suffix=" WPM" accent="building" />
                 <StatBlock label="Best" value={stats.bestWpm} suffix=" WPM" accent="fast" />
+                <StatBlock label="Est. Accuracy" value={accuracy ?? "—"} suffix={accuracy === null ? undefined : "%"} accent="accuracy" />
                 <StatBlock label="Samples" value={stats.samples} />
             </div>
 
@@ -547,6 +755,8 @@ function WPMStatsSettings() {
                 <span>Faster</span>
             </div>
 
+            <AccuracyKeyboard stats={stats} />
+
             <Button
                 className="vc-typing-wpm-reset"
                 color={Button.Colors.RED}
@@ -578,6 +788,7 @@ const WPMChatBarButton: ChatBarButtonFactory = ({ isMainChat }) => {
 };
 
 const PRINTABLE_RE = /^.$/u;
+const NAV_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Delete"]);
 
 function handleKeyDown(e: KeyboardEvent) {
     const target = e.target as HTMLElement | null;
@@ -593,10 +804,44 @@ function handleKeyDown(e: KeyboardEvent) {
 
     if (!inMessageBox) return;
     if (!target.closest("form")) return;
-    if (e.ctrlKey || e.altKey || e.metaKey || e.repeat) return;
-    if (!PRINTABLE_RE.test(e.key)) return;
+    if (e.isComposing || e.keyCode === 229) return resetDraft(); // IME text can't be tracked, so stop attributing to earlier keys
 
-    charTimestamps.push(Date.now());
+    if (target !== lastTarget) {
+        resetDraft();
+        lastTarget = target;
+    }
+
+    // Until history has loaded nothing is buffered for accuracy (the draft is reset), but WPM timing below still runs.
+    if (!loaded) resetDraft();
+
+    if (e.key === "Backspace") {
+        if (e.altKey || e.metaKey) return resetDraft(); // semantics differ per OS, so don't guess
+        recordBackspace(e.ctrlKey);
+        scheduleFlush();
+        return;
+    }
+    if (e.key === "Enter") {
+        if (e.shiftKey) { if (loaded) pendingKeys.push("\n"); } else resetDraft();
+        return;
+    }
+    if (NAV_KEYS.has(e.key)) return resetDraft();
+
+    const altGr = e.getModifierState?.("AltGraph");
+    if (!altGr && (e.ctrlKey || e.altKey || e.metaKey)) {
+        if (e.key.length === 1) resetDraft(); // e.g. Ctrl+V / Ctrl+Z change the draft invisibly
+        return;
+    }
+    if (e.repeat || !PRINTABLE_RE.test(e.key)) return;
+
+    const now = Date.now();
+    if (loaded) {
+        pendingKeys.push(e.key.toLowerCase());
+        if (pendingKeys.length >= MAX_PENDING) flushPending(); else scheduleFlush();
+    }
+
+    charTimestamps.push(now);
+    const cutoff = now - getWindowMs();
+    while (charTimestamps.length && charTimestamps[0] < cutoff) charTimestamps.shift();
     WPMEvents.emit("keystroke");
 }
 
@@ -626,6 +871,14 @@ export default definePlugin({
             idleTimer = null;
         }
 
+        flushPending();
         void saveStatsNow();
+        loaded = false;
+        loadGen++;
+        pendingKeys = [];
+        pendingErrors = [];
+        lateErrors = [];
+        counted = [];
+        lastTarget = null;
     },
 });
